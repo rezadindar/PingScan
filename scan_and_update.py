@@ -15,17 +15,20 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 import requests
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
-PANEL_URL   = "https://your-panel.example.com"  # ← آدرس پنل رمناویو
-PANEL_TOKEN = "YOUR_SECRET_TOKEN"               # ← توکن Bearer
+PANEL_URL   = "https://master.vestapanel.top"  # ← آدرس پنل رمناویو
+PANEL_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1dWlkIjoiMjBmYTg3ZTYtNjU0MS00ODAxLWIyMTctMDljNGI0MzJiNDBkIiwidXNlcm5hbWUiOm51bGwsInJvbGUiOiJBUEkiLCJpYXQiOjE3ODE3MDEyODIsImV4cCI6MTA0MjE2MTQ4ODJ9.vnwRwkM7uG4-9UEEUpzkvcZWFpyTl5N1gSRE6CKWTAI"               # ← توکن Bearer
 
 RANGES_FILE = "ranges.txt"
 OUTPUT_FILE = "reachable_hosts.txt"
 THREADS     = 128
+BATCH       = 32
 TIMEOUT     = 1    # seconds per traceroute hop
 PICK_COUNT  = 10   # IPs to assign per host (from different /24 ranges)
 # ───────────────────────────────────────────────────────────────────────────────
@@ -273,6 +276,65 @@ def run_update(ips, base_url, token, count):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  LOOP MODE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def run_loop(args, base_url):
+    """
+    Loop mode:
+      - Every SCAN_INTERVAL  hours → re-scan and update hosts
+      - Every UPDATE_INTERVAL hours → shuffle & update hosts from last scan (no re-scan)
+    """
+    scan_interval   = args.scan_interval   * 3600   # hours → seconds
+    update_interval = args.update_interval * 3600
+
+    cached_ips: list[str] = []
+    last_scan_time  = 0.0
+    last_update_time = 0.0
+
+    print(f"[i] Loop mode started — scan every {args.scan_interval}h / update every {args.update_interval}h")
+    print(f"[i] Press Ctrl+C to stop.\n")
+
+    while not stop_event.is_set():
+        now = time.monotonic()
+
+        # ── Full re-scan ────────────────────────────────────────────────────
+        if now - last_scan_time >= scan_interval:
+            print(f"\n{'='*60}")
+            print(f"[{_now()}] ♻️  Starting scheduled scan…")
+            print(f"{'='*60}")
+            cached_ips = run_scan(
+                args.input, args.output, args.threads, args.batch,
+                args.timeout, args.sample, args.quiet
+            )
+            last_scan_time  = time.monotonic()
+            last_update_time = last_scan_time   # update just ran inside run_scan→run_update below
+
+            print(f"\n[{_now()}] Updating hosts after scan…")
+            run_update(cached_ips, base_url, PANEL_TOKEN, args.count)
+            last_update_time = time.monotonic()
+
+        # ── Hourly shuffle-update (no re-scan) ─────────────────────────────
+        elif now - last_update_time >= update_interval:
+            print(f"\n[{_now()}] 🔄 Hourly update — shuffling IPs from last scan…")
+            run_update(cached_ips, base_url, PANEL_TOKEN, args.count)
+            last_update_time = time.monotonic()
+
+        # ── Sleep until next event ──────────────────────────────────────────
+        else:
+            next_update = last_update_time + update_interval - time.monotonic()
+            next_scan   = last_scan_time   + scan_interval   - time.monotonic()
+            sleep_secs  = max(1, min(next_update, next_scan, 60))
+            stop_event.wait(sleep_secs)
+
+    print("\n[i] Loop stopped.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -286,8 +348,8 @@ def main():
                         help=f"Reachable IPs output file (default: {OUTPUT_FILE})")
     parser.add_argument('-t', '--threads', type=int, default=THREADS,
                         help=f"Parallel threads (default: {THREADS})")
-    parser.add_argument('-b', '--batch',   type=int, default=8,
-                        help="Subnets per batch (default: 8)")
+    parser.add_argument('-b', '--batch',   type=int, default=BATCH,
+                        help=f"Subnets per batch (default: {BATCH})")
     parser.add_argument('-w', '--timeout', type=int, default=TIMEOUT,
                         help=f"Traceroute timeout per hop in seconds (default: {TIMEOUT})")
     parser.add_argument('-n', '--count',   type=int, default=PICK_COUNT,
@@ -297,13 +359,26 @@ def main():
     parser.add_argument('-q', '--quiet',   action='store_true',
                         help="Suppress per-IP output")
     parser.add_argument('--scan-only',    action='store_true',
-                        help="Only scan; do not update Remnawave hosts")
+                        help="Only scan once; do not update Remnawave hosts")
     parser.add_argument('--update-only',  action='store_true',
                         help="Skip scan; update hosts from existing output file")
+    parser.add_argument('--loop',         action='store_true',
+                        help="Loop mode: re-scan every --scan-interval hours, "
+                             "update hosts every --update-interval hours")
+    parser.add_argument('--scan-interval',   type=float, default=24,
+                        help="Hours between full re-scans in loop mode (default: 24)")
+    parser.add_argument('--update-interval', type=float, default=1,
+                        help="Hours between host updates in loop mode (default: 1)")
     args = parser.parse_args()
 
     base_url = PANEL_URL.rstrip("/")
 
+    # ── loop mode ────────────────────────────────────────────────────────────
+    if args.loop:
+        run_loop(args, base_url)
+        return
+
+    # ── update-only ──────────────────────────────────────────────────────────
     if args.update_only:
         try:
             with open(args.output) as f:
@@ -314,6 +389,7 @@ def main():
         run_update(ips, base_url, PANEL_TOKEN, args.count)
         return
 
+    # ── single run ───────────────────────────────────────────────────────────
     ips = run_scan(args.input, args.output, args.threads, args.batch,
                    args.timeout, args.sample, args.quiet)
 
