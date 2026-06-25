@@ -22,15 +22,26 @@ from datetime import datetime
 import requests
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
-PANEL_URL   = "https://master.vestapanel.top"  # ← آدرس پنل رمناویو
-PANEL_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1dWlkIjoiMjBmYTg3ZTYtNjU0MS00ODAxLWIyMTctMDljNGI0MzJiNDBkIiwidXNlcm5hbWUiOm51bGwsInJvbGUiOiJBUEkiLCJpYXQiOjE3ODE3MDEyODIsImV4cCI6MTA0MjE2MTQ4ODJ9.vnwRwkM7uG4-9UEEUpzkvcZWFpyTl5N1gSRE6CKWTAI"               # ← توکن Bearer
+# هر آیتم: url، token، و tag (اگر None باشد همه هاست‌ها آپدیت می‌شوند)
+SERVERS = [
+    {
+        "url":   "https://master.vestapanel.top",
+        "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1dWlkIjoiMjBmYTg3ZTYtNjU0MS00ODAxLWIyMTctMDljNGI0MzJiNDBkIiwidXNlcm5hbWUiOm51bGwsInJvbGUiOiJBUEkiLCJpYXQiOjE3ODE3MDEyODIsImV4cCI6MTA0MjE2MTQ4ODJ9.vnwRwkM7uG4-9UEEUpzkvcZWFpyTl5N1gSRE6CKWTAI",
+        "tag":   None,            # همه هاست‌ها
+    },
+    {
+        "url":   "https://panel.alibabasmart.com",
+        "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1dWlkIjoiZDVjYTdmNzEtMDZiMy00MzZjLWI5OGEtZWExZmQ1OWFmYWYxIiwidXNlcm5hbWUiOm51bGwsInJvbGUiOiJBUEkiLCJpYXQiOjE3Njc0MzU5NTQsImV4cCI6MTA0MDczNDk1NTR9.TpVNxy-srnvPz3mnk__xFNiAT31_hJNs14fzupmubkA",
+        "tag":   "CLOUDFLARE",    # فقط هاست‌هایی با این تگ
+    },
+]
 
 RANGES_FILE = "ranges.txt"
 OUTPUT_FILE = "reachable_hosts.txt"
 THREADS     = 128
 BATCH       = 32
 TIMEOUT     = 1    # seconds per traceroute hop
-PICK_COUNT  = 10   # IPs to assign per host (from different /24 ranges)
+PICK_COUNT  = 20   # IPs to assign per host (from different /24 ranges)
 # ───────────────────────────────────────────────────────────────────────────────
 
 IS_WINDOWS = platform.system().lower() == "windows"
@@ -205,28 +216,18 @@ def get_all_hosts(base_url, token):
 def update_host_address(base_url, token, host, address_str):
     nullable_str_fields = {"path", "sni", "host", "alpn", "fingerprint",
                            "serverDescription", "tag", "vlessRouteId", "xrayJsonTemplateUuid"}
-    payload = {
-        "uuid": host["uuid"],
-        "inbound": host["inbound"],
-        "remark": host["remark"],
-        "address": address_str,
-        "port": host["port"],
-        "isDisabled": host["isDisabled"],
-        "securityLayer": host["securityLayer"],
-        "xHttpExtraParams": host["xHttpExtraParams"],
-        "muxParams": host["muxParams"],
-        "sockoptParams": host["sockoptParams"],
-        "finalMask": host["finalMask"],
-        "isHidden": host["isHidden"],
-        "overrideSniFromAddress": host["overrideSniFromAddress"],
-        "keepSniBlank": host["keepSniBlank"],
-        "allowInsecure": host["allowInsecure"],
-        "shuffleHost": host["shuffleHost"],
-        "mihomoX25519": host["mihomoX25519"],
-        "nodes": host["nodes"],
-        "excludedInternalSquads": host["excludedInternalSquads"],
-        "excludeFromSubscriptionTypes": host["excludeFromSubscriptionTypes"],
-    }
+    # فیلدهای اجباری — با .get() تا اگر پنل قدیمی‌تر بود KeyError ندهد
+    required_fields = [
+        "uuid", "inbound", "remark", "port", "isDisabled", "securityLayer",
+        "xHttpExtraParams", "muxParams", "sockoptParams", "finalMask",
+        "isHidden", "overrideSniFromAddress", "keepSniBlank", "allowInsecure",
+        "shuffleHost", "mihomoX25519", "nodes",
+        "excludedInternalSquads", "excludeFromSubscriptionTypes",
+    ]
+    payload = {"address": address_str}
+    for field in required_fields:
+        if field in host:
+            payload[field] = host[field]
     for field in nullable_str_fields:
         if host.get(field) is not None:
             payload[field] = host[field]
@@ -237,42 +238,67 @@ def update_host_address(base_url, token, host, address_str):
     return r.json()["response"]
 
 
-def run_update(ips, base_url, token, count):
-    """Pick diverse IPs and update all Remnawave hosts."""
+def run_update(ips, base_url, token, count, tag_filter=None):
+    """Pick diverse IPs and update Remnawave hosts (optionally filtered by tag)."""
+    label = f"{base_url}" + (f" [tag={tag_filter}]" if tag_filter else " [all hosts]")
+
     if not ips:
-        print("[!] No IPs available — skipping host update.")
+        print(f"[!] {label} — No IPs available, skipping.")
         return
 
     selected = pick_ips_from_diverse_ranges(ips, count)
     if not selected:
-        print("[!] Could not select IPs from diverse ranges.")
+        print(f"[!] {label} — Could not select IPs from diverse ranges.")
         return
 
     address_str = ",".join(selected)
-    print(f"[i] Selected {len(selected)} IPs from different /24 ranges:")
-    print(f"    {address_str}\n")
+    print(f"[i] {label}")
+    print(f"    Selected {len(selected)} IPs: {address_str}")
 
-    print("[i] Fetching hosts from Remnawave...")
     try:
-        hosts = get_all_hosts(base_url, token)
+        all_hosts = get_all_hosts(base_url, token)
     except Exception as e:
-        print(f"[!] Could not fetch hosts: {e}")
+        print(f"[!] {label} — Could not fetch hosts: {e}")
         return
 
-    print(f"[i] {len(hosts)} host(s) found.\n")
+    hosts = (
+        [h for h in all_hosts if h.get("tag") == tag_filter]
+        if tag_filter is not None
+        else all_hosts
+    )
+    print(f"[i] {label} — {len(hosts)}/{len(all_hosts)} host(s) to update.")
+
     ok = 0
     for host in hosts:
         remark = host.get("remark") or host["uuid"]
         try:
             update_host_address(base_url, token, host, address_str)
-            print(f"[+] Updated: {remark}")
+            print(f"[+] {label} — Updated: {remark}")
             ok += 1
         except requests.HTTPError as e:
-            print(f"[!] Failed to update '{remark}': {e.response.status_code} {e.response.text}")
+            print(f"[!] {label} — Failed '{remark}': {e.response.status_code} {e.response.text}")
         except Exception as e:
-            print(f"[!] Error updating '{remark}': {e}")
+            print(f"[!] {label} — Error '{remark}': {e}")
 
-    print(f"\n✅ Done. {ok}/{len(hosts)} host(s) updated.")
+    print(f"✅ {label} — {ok}/{len(hosts)} host(s) updated.")
+
+
+def run_update_all_servers(ips, servers, count):
+    """Update all configured servers simultaneously in parallel threads."""
+    threads = []
+    for srv in servers:
+        t = threading.Thread(
+            target=run_update,
+            args=(ips, srv["url"].rstrip("/"), srv["token"], count),
+            kwargs={"tag_filter": srv.get("tag")},
+            daemon=True,
+        )
+        threads.append(t)
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -283,7 +309,7 @@ def _now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def run_loop(args, base_url):
+def run_loop(args):
     """
     Loop mode:
       - Every SCAN_INTERVAL  hours → re-scan and update hosts
@@ -299,11 +325,22 @@ def run_loop(args, base_url):
     print(f"[i] Loop mode started — scan every {args.scan_interval}h / update every {args.update_interval}h")
     print(f"[i] Press Ctrl+C to stop.\n")
 
+    # ── اگر -u همراه -l بود، از فایل موجود بارگذاری کن و scan نزن ──────────
+    if args.update_only:
+        try:
+            with open(args.output) as f:
+                cached_ips = [l.strip() for l in f if l.strip()]
+            print(f"[i] Loaded {len(cached_ips)} IPs from '{args.output}' (no scan).")
+        except FileNotFoundError:
+            print(f"[!] '{args.output}' not found. Remove -u to enable scanning.")
+            return
+        last_scan_time = time.monotonic()   # بلاک کن که scan دوباره نزند
+
     while not stop_event.is_set():
         now = time.monotonic()
 
-        # ── Full re-scan ────────────────────────────────────────────────────
-        if now - last_scan_time >= scan_interval:
+        # ── Full re-scan (فقط اگر -u نباشد) ────────────────────────────────
+        if not args.update_only and now - last_scan_time >= scan_interval:
             print(f"\n{'='*60}")
             print(f"[{_now()}] ♻️  Starting scheduled scan…")
             print(f"{'='*60}")
@@ -312,16 +349,15 @@ def run_loop(args, base_url):
                 args.timeout, args.sample, args.quiet
             )
             last_scan_time  = time.monotonic()
-            last_update_time = last_scan_time   # update just ran inside run_scan→run_update below
 
             print(f"\n[{_now()}] Updating hosts after scan…")
-            run_update(cached_ips, base_url, PANEL_TOKEN, args.count)
+            run_update_all_servers(cached_ips, SERVERS, args.count)
             last_update_time = time.monotonic()
 
         # ── Hourly shuffle-update (no re-scan) ─────────────────────────────
         elif now - last_update_time >= update_interval:
             print(f"\n[{_now()}] 🔄 Hourly update — shuffling IPs from last scan…")
-            run_update(cached_ips, base_url, PANEL_TOKEN, args.count)
+            run_update_all_servers(cached_ips, SERVERS, args.count)
             last_update_time = time.monotonic()
 
         # ── Sleep until next event ──────────────────────────────────────────
@@ -354,28 +390,26 @@ def main():
                         help=f"Traceroute timeout per hop in seconds (default: {TIMEOUT})")
     parser.add_argument('-n', '--count',   type=int, default=PICK_COUNT,
                         help=f"IPs to assign per host from diverse ranges (default: {PICK_COUNT})")
-    parser.add_argument('-s', '--sample',  action='store_true',
+    parser.add_argument('-S', '--sample',  action='store_true',
                         help="Sample ~5 hosts per /24 instead of all 254")
     parser.add_argument('-q', '--quiet',   action='store_true',
                         help="Suppress per-IP output")
-    parser.add_argument('--scan-only',    action='store_true',
+    parser.add_argument('-s', '--scan-only',    action='store_true',
                         help="Only scan once; do not update Remnawave hosts")
-    parser.add_argument('--update-only',  action='store_true',
+    parser.add_argument('-u', '--update-only',  action='store_true',
                         help="Skip scan; update hosts from existing output file")
-    parser.add_argument('--loop',         action='store_true',
+    parser.add_argument('-l', '--loop',         action='store_true',
                         help="Loop mode: re-scan every --scan-interval hours, "
                              "update hosts every --update-interval hours")
-    parser.add_argument('--scan-interval',   type=float, default=24,
+    parser.add_argument('-I', '--scan-interval',   type=float, default=24,
                         help="Hours between full re-scans in loop mode (default: 24)")
-    parser.add_argument('--update-interval', type=float, default=1,
+    parser.add_argument('-U', '--update-interval', type=float, default=1,
                         help="Hours between host updates in loop mode (default: 1)")
     args = parser.parse_args()
 
-    base_url = PANEL_URL.rstrip("/")
-
     # ── loop mode ────────────────────────────────────────────────────────────
     if args.loop:
-        run_loop(args, base_url)
+        run_loop(args)
         return
 
     # ── update-only ──────────────────────────────────────────────────────────
@@ -386,7 +420,7 @@ def main():
         except FileNotFoundError:
             print(f"[!] '{args.output}' not found. Run a scan first.")
             sys.exit(1)
-        run_update(ips, base_url, PANEL_TOKEN, args.count)
+        run_update_all_servers(ips, SERVERS, args.count)
         return
 
     # ── single run ───────────────────────────────────────────────────────────
@@ -394,7 +428,7 @@ def main():
                    args.timeout, args.sample, args.quiet)
 
     if not args.scan_only:
-        run_update(ips, base_url, PANEL_TOKEN, args.count)
+        run_update_all_servers(ips, SERVERS, args.count)
 
 
 if __name__ == "__main__":
